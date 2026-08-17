@@ -134,8 +134,14 @@ def demix(
     batch_size = config.inference.batch_size
 
     use_amp = getattr(config.training, 'use_amp', True)
+    dev_type = getattr(device, "type", str(device)).split(":")[0]
+    if dev_type in ["cuda", "mps", "cpu"]:
+        amp_dtype = torch.float16 if dev_type in ["cuda", "mps"] else torch.bfloat16
+        autocast_ctx = torch.autocast(device_type=dev_type, dtype=amp_dtype, enabled=use_amp)
+    else:
+        autocast_ctx = torch.autocast(device_type="cpu", enabled=False)
 
-    with torch.cuda.amp.autocast(enabled=use_amp):
+    with autocast_ctx:
         with torch.inference_mode():
             # Initialize result and counter tensors
             req_shape = (num_instruments,) + mix.shape
@@ -188,6 +194,12 @@ def demix(
 
                     batch_data.clear()
                     batch_locations.clear()
+                    del arr
+                    del x
+                    if dev_type == "mps":
+                        torch.mps.empty_cache()
+                    elif dev_type == "cuda":
+                        torch.cuda.empty_cache()
 
                 if progress_bar:
                     progress_bar.update(step)

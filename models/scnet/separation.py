@@ -66,7 +66,18 @@ class DualPathRNN(nn.Module):
         # Frequency-path
         x = self.norm_layers[0](x)
         x = x.transpose(1, 3).contiguous().view(B * T, F, C)
-        x, _ = self.lstm_layers[0](x)
+        
+        # Sub-batch LSTM processing to prevent massive workspace allocations on MPS/GPU
+        batch_limit = 32
+        if x.shape[0] > batch_limit:
+            x_chunks = []
+            for b_idx in range(0, x.shape[0], batch_limit):
+                sub_out, _ = self.lstm_layers[0](x[b_idx:b_idx + batch_limit])
+                x_chunks.append(sub_out)
+            x = torch.cat(x_chunks, dim=0)
+        else:
+            x, _ = self.lstm_layers[0](x)
+
         x = self.linear_layers[0](x)
         x = x.view(B, T, F, C).transpose(1, 3)
         x = x + original_x
@@ -75,7 +86,16 @@ class DualPathRNN(nn.Module):
         # Time-path
         x = self.norm_layers[1](x)
         x = x.transpose(1, 2).contiguous().view(B * F, C, T).transpose(1, 2)
-        x, _ = self.lstm_layers[1](x)
+        
+        if x.shape[0] > batch_limit:
+            x_chunks = []
+            for b_idx in range(0, x.shape[0], batch_limit):
+                sub_out, _ = self.lstm_layers[1](x[b_idx:b_idx + batch_limit])
+                x_chunks.append(sub_out)
+            x = torch.cat(x_chunks, dim=0)
+        else:
+            x, _ = self.lstm_layers[1](x)
+
         x = self.linear_layers[1](x)
         x = x.transpose(1, 2).contiguous().view(B, F, C, T).transpose(1, 2)
         x = x + original_x
