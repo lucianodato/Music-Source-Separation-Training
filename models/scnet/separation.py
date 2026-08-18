@@ -69,6 +69,10 @@ class DualPathRNN(nn.Module):
         
         # Sub-batch LSTM processing to prevent massive workspace allocations on MPS/GPU
         batch_limit = 32
+        lstm0_dtype = self.lstm_layers[0].weight_ih_l0.dtype
+        if x.dtype != lstm0_dtype:
+            x = x.to(lstm0_dtype)
+
         if x.shape[0] > batch_limit:
             x_chunks = []
             for b_idx in range(0, x.shape[0], batch_limit):
@@ -78,15 +82,22 @@ class DualPathRNN(nn.Module):
         else:
             x, _ = self.lstm_layers[0](x)
 
+        lin0_dtype = self.linear_layers[0].weight.dtype
+        if x.dtype != lin0_dtype:
+            x = x.to(lin0_dtype)
         x = self.linear_layers[0](x)
         x = x.view(B, T, F, C).transpose(1, 3)
-        x = x + original_x
+        x = x.to(original_x.dtype) + original_x
 
         original_x = x
         # Time-path
         x = self.norm_layers[1](x)
         x = x.transpose(1, 2).contiguous().view(B * F, C, T).transpose(1, 2)
         
+        lstm1_dtype = self.lstm_layers[1].weight_ih_l0.dtype
+        if x.dtype != lstm1_dtype:
+            x = x.to(lstm1_dtype)
+
         if x.shape[0] > batch_limit:
             x_chunks = []
             for b_idx in range(0, x.shape[0], batch_limit):
@@ -96,9 +107,12 @@ class DualPathRNN(nn.Module):
         else:
             x, _ = self.lstm_layers[1](x)
 
+        lin1_dtype = self.linear_layers[1].weight.dtype
+        if x.dtype != lin1_dtype:
+            x = x.to(lin1_dtype)
         x = self.linear_layers[1](x)
         x = x.transpose(1, 2).contiguous().view(B, F, C, T).transpose(1, 2)
-        x = x + original_x
+        x = x.to(original_x.dtype) + original_x
 
         return x
 
