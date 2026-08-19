@@ -194,18 +194,49 @@ def format_filename(template, **kwargs):
 
 def proc_folder(dict_args):
     args = parse_args_inference(dict_args)
-    device = "cpu"
-    if args.force_cpu:
+    device = getattr(args, "device", "auto")
+    if args.force_cpu or device == "cpu":
         device = "cpu"
-    elif torch.cuda.is_available():
+    elif device == "mlx":
+        device = "mlx"
+    elif torch.cuda.is_available() and device in ["cuda", "auto"]:
         print('CUDA is available, use --force_cpu to disable it.')
         device = f'cuda:{args.device_ids[0]}' if isinstance(args.device_ids, list) else f'cuda:{args.device_ids}'
-    elif torch.backends.mps.is_available():
+    elif torch.backends.mps.is_available() and device in ["mps", "auto"]:
         device = "mps"
+    else:
+        device = "cpu"
+
+    # Check if MLX is preferred on Apple Silicon
+    from utils.mlx_engine import is_mlx_available, can_run_on_mlx, load_mlx_model, bigshifts_wrapper_mlx
+    use_mlx = False
+    if (args.device == "mlx" or (args.device == "auto" and device == "mps")) and is_mlx_available():
+        can_run, reason = can_run_on_mlx(args.model_type, args.config_path, args.start_check_point)
+        if can_run:
+            use_mlx = True
+            device = "mlx"
+        elif args.device == "mlx":
+            print(f"⚠️  [MLX Notice] {reason}")
+            print("➡️  Falling back to Apple Silicon GPU via PyTorch MPS...")
+            device = "mps"
 
     print("Using device: ", device)
 
     model_load_start_time = time.time()
+
+    if use_mlx:
+        try:
+            model, config, resolved_mtype = load_mlx_model(args.model_type, args.config_path, args.start_check_point)
+            args.model_type = resolved_mtype
+            print("Instruments: {}".format(config.get("training", {}).get("instruments", [])))
+            print("Model load time (MLX): {:.2f} sec".format(time.time() - model_load_start_time))
+            run_folder_mlx(model, args, config, verbose=True)
+            return
+        except Exception as e:
+            print(f"⚠️  [MLX Notice] Failed to load model in MLX: {e}")
+            print("➡️  Falling back to Apple Silicon GPU via PyTorch MPS...")
+            device = "mps"
+
     torch.backends.cudnn.benchmark = True
 
     model, config = get_model_from_config(args.model_type, args.config_path)
@@ -228,5 +259,107 @@ def proc_folder(dict_args):
     run_folder(model, args, config, device, verbose=True)
 
 
+def run_folder_mlx(
+    model: Any,
+    args: "argparse.Namespace",
+    config: dict,
+    verbose: bool = False
+) -> None:
+    from utils.mlx_engine import bigshifts_wrapper_mlx
+    start_time = time.time()
+
+    mixture_paths = sorted(
+        glob.glob(os.path.join(args.input_folder, "**/*.*"), recursive=True)
+    )
+    mixture_paths = [p for p in mixture_paths if os.path.isfile(p)]
+    sample_rate: int = getattr(config.get("audio", {}), "sample_rate", 44100) if isinstance(config, dict) else 44100
+
+    print(f"Total files found: {len(mixture_paths)}. Using sample rate: {sample_rate}")
+
+    training_cfg = config.get("training", {}) if isinstance(config, dict) else {}
+    target_instr = training_cfg.get("target_instrument")
+    instruments: list[str] = [target_instr] if target_instr else training_cfg.get("instruments", ["vocals", "bass", "drums", "other"])[:]
+    os.makedirs(args.store_dir, exist_ok=True)
+
+    if not verbose:
+        mixture_paths = tqdm(mixture_paths, desc="Total progress")
+
+    detailed_pbar = not args.disable_detailed_pbar
+
+    for path in mixture_paths:
+        relative_path: str = os.path.relpath(path, args.input_folder)
+        dir_name: str = os.path.dirname(relative_path)
+        file_name: str = os.path.splitext(os.path.basename(path))[0]
+
+        try:
+            mix, sr = librosa.load(path, sr=sample_rate, mono=False)
+        except Exception as e:
+            print(f"Cannot read track: {format(path)}")
+            print(f"Error message: {str(e)}")
+            continue
+
+        if len(mix.shape) == 1:
+            mix = np.stack([mix, mix], axis=0)
+
+        mix_orig = mix.copy()
+        norm_params = None
+        if "normalize" in config.get("inference", {}):
+            if config["inference"]["normalize"] is True:
+                mix, norm_params = normalize_audio(mix)
+
+        waveforms_orig = bigshifts_wrapper_mlx(
+            config,
+            model,
+            mix,
+            model_type=args.model_type,
+            pbar=detailed_pbar,
+            bigshifts=args.bigshifts
+        )
+
+        if target_instr and len(instruments) == 1 and target_instr in waveforms_orig and "other" not in waveforms_orig:
+            waveforms_orig["other"] = mix_orig - waveforms_orig[target_instr]
+            instruments.append("other")
+
+        if args.extract_instrumental:
+            instr = "vocals" if "vocals" in instruments else instruments[0]
+            waveforms_orig["instrumental"] = mix_orig - waveforms_orig[instr]
+            if "instrumental" not in instruments:
+                instruments.append("instrumental")
+
+        for instr in instruments:
+            estimates = waveforms_orig[instr]
+            if norm_params is not None and "normalize" in config.get("inference", {}):
+                if config["inference"]["normalize"] is True:
+                    estimates = denormalize_audio(estimates, norm_params)
+
+            peak: float = float(np.abs(estimates).max())
+            codec = "flac" if peak <= 1.0 and args.pcm_type != 'FLOAT' else "wav"
+            subtype = args.pcm_type
+
+            dirnames, fname = format_filename(
+                args.filename_template,
+                instr=instr,
+                start_time=int(start_time),
+                file_name=file_name,
+                dir_name=dir_name,
+                model_type=args.model_type,
+                model=os.path.splitext(os.path.basename(args.start_check_point))[0],
+            )
+
+            output_dir: str = os.path.join(args.store_dir, *dirnames)
+            os.makedirs(output_dir, exist_ok=True)
+
+            output_path: str = os.path.join(output_dir, f"{fname}.{codec}")
+            sf.write(output_path, estimates.T, sr, subtype=subtype)
+
+            if args.draw_spectro > 0:
+                output_img_path = os.path.join(output_dir, f"{fname}.jpg")
+                draw_spectrogram(estimates.T, sr, args.draw_spectro, output_img_path)
+                print("Wrote file:", output_img_path)
+
+    print(f"Elapsed time: {time.time() - start_time:.2f} seconds.")
+
+
 if __name__ == "__main__":
     proc_folder(None)
+
