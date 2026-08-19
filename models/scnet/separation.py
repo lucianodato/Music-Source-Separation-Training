@@ -68,7 +68,7 @@ class DualPathRNN(nn.Module):
         x = x.transpose(1, 3).contiguous().view(B * T, F, C)
         
         # Sub-batch LSTM processing to prevent massive workspace allocations on MPS/GPU
-        batch_limit = 32
+        batch_limit = 64
         lstm0_dtype = self.lstm_layers[0].weight_ih_l0.dtype
         if x.dtype != lstm0_dtype:
             x = x.to(lstm0_dtype)

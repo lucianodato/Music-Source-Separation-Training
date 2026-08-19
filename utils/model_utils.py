@@ -4,6 +4,11 @@ __author__ = 'Roman Solovyev (ZFTurbo): https://github.com/ZFTurbo/'
 import argparse
 import json
 import os
+
+# Optimize Apple Silicon MPS allocator threshold and fallback
+os.environ.setdefault("PYTORCH_MPS_HIGH_WATERMARK_RATIO", "0.0")
+os.environ.setdefault("PYTORCH_ENABLE_MPS_FALLBACK", "1")
+
 from datetime import datetime
 import numpy as np
 import torch
@@ -135,20 +140,30 @@ def demix(
 
     use_amp = getattr(config.training, 'use_amp', True)
     dev_type = getattr(device, "type", str(device)).split(":")[0]
-    if dev_type in ["cuda", "mps", "cpu"]:
-        amp_dtype = torch.float16 if dev_type in ["cuda", "mps"] else torch.bfloat16
+    if dev_type == "mps":
+        # Models with recurrent/LSTM layers (e.g. SCNet) benefit from FP32 stability on MPS,
+        # while Transformer/Conv architectures (e.g. RoFormer, MDX23C) benefit from FP16.
+        if any(k in str(model_type).lower() for k in ["scnet", "bandit", "demucs"]):
+            autocast_ctx = torch.autocast(device_type="cpu", enabled=False)
+        elif use_amp:
+            autocast_ctx = torch.autocast(device_type="mps", dtype=torch.float16, enabled=True)
+        else:
+            autocast_ctx = torch.autocast(device_type="cpu", enabled=False)
+    elif dev_type in ["cuda", "cpu"]:
+        amp_dtype = torch.float16 if dev_type == "cuda" else torch.bfloat16
         autocast_ctx = torch.autocast(device_type=dev_type, dtype=amp_dtype, enabled=use_amp)
     else:
         autocast_ctx = torch.autocast(device_type="cpu", enabled=False)
 
     with autocast_ctx:
         with torch.inference_mode():
-            # Initialize result and counter tensors
+            # Initialize result and counter tensors on CPU to keep MPS VRAM usage strictly bounded to chunk batches
             req_shape = (num_instruments,) + mix.shape
-            result = torch.zeros(req_shape, dtype=torch.float32)
-            counter = torch.zeros(req_shape, dtype=torch.float32)
+            result = torch.zeros(req_shape, dtype=torch.float32, device="cpu")
+            counter = torch.zeros(req_shape, dtype=torch.float32, device="cpu")
 
             i = 0
+            batch_count = 0
             batch_data = []
             batch_locations = []
             if pbar and should_print:
@@ -159,8 +174,8 @@ def demix(
                 progress_bar = None
 
             while i < mix.shape[1]:
-                # Extract chunk and apply padding if necessary
-                part = mix[:, i:i + chunk_size].to(device)
+                # Extract chunk and apply padding on CPU before batch transfer
+                part = mix[:, i:i + chunk_size]
                 chunk_len = part.shape[-1]
                 if mode == "generic" and chunk_len > chunk_size // 2:
                     pad_mode = "reflect"
@@ -174,8 +189,9 @@ def demix(
 
                 # Process batch if it's full or the end is reached
                 if len(batch_data) >= batch_size or i >= mix.shape[1]:
-                    arr = torch.stack(batch_data, dim=0)
+                    arr = torch.stack(batch_data, dim=0).to(device, non_blocking=True)
                     x = model(arr)
+                    out_cpu = x.detach().cpu()
 
                     if mode == "generic":
                         window = windowing_array.clone() # using clone() fixes the clicks at chunk edges when using batch_size=1
@@ -186,26 +202,35 @@ def demix(
 
                     for j, (start, seg_len) in enumerate(batch_locations):
                         if mode == "generic":
-                            result[..., start:start + seg_len] += x[j, ..., :seg_len].cpu() * window[..., :seg_len]
+                            result[..., start:start + seg_len] += out_cpu[j, ..., :seg_len] * window[..., :seg_len]
                             counter[..., start:start + seg_len] += window[..., :seg_len]
                         else:
-                            result[..., start:start + seg_len] += x[j, ..., :seg_len].cpu()
+                            result[..., start:start + seg_len] += out_cpu[j, ..., :seg_len]
                             counter[..., start:start + seg_len] += 1.0
 
                     batch_data.clear()
                     batch_locations.clear()
                     del arr
                     del x
-                    if dev_type == "mps":
-                        torch.mps.empty_cache()
-                    elif dev_type == "cuda":
-                        torch.cuda.empty_cache()
+                    del out_cpu
+                    batch_count += 1
+                    # Avoid synchronous stalls on every single chunk; throttle cache clearing
+                    if batch_count % 16 == 0:
+                        if dev_type == "mps":
+                            torch.mps.empty_cache()
+                        elif dev_type == "cuda":
+                            torch.cuda.empty_cache()
 
                 if progress_bar:
                     progress_bar.update(step)
 
             if progress_bar:
                 progress_bar.close()
+
+            if dev_type == "mps":
+                torch.mps.empty_cache()
+            elif dev_type == "cuda":
+                torch.cuda.empty_cache()
 
             # Compute final estimated sources
             estimated_sources = result / counter
