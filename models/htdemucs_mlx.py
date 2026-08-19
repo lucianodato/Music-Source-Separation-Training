@@ -62,13 +62,13 @@ def mlx_spectro(x: mx.array, n_fft: int = 4096, hop_length: Optional[int] = None
     return out.reshape(*orig_shape[:-1], freqs, num_frames, 2)
 
 
-def mlx_ispectro(spec_real_imag: mx.array, hop_length: Optional[int] = None, length: Optional[int] = None) -> np.ndarray:
+def mlx_ispectro(spec_real_imag: mx.array, hop_length: Optional[int] = None, length: Optional[int] = None) -> mx.array:
     """
-    Computes inverse real STFT matching Demucs ispectro with Hann window synthesis.
+    Computes inverse real STFT matching Demucs ispectro with vectorized Hann window synthesis.
     Args:
         spec_real_imag: (..., freqs, frames, 2)
     Returns:
-        (..., length) float32 numpy array
+        (..., length) float32 mx.array
     """
     orig_shape = spec_real_imag.shape
     freqs = orig_shape[-3]
@@ -90,20 +90,26 @@ def mlx_ispectro(spec_real_imag: mx.array, hop_length: Optional[int] = None, len
     windowed = frames * window
 
     total_samples = (num_frames - 1) * hl + win_length
-    out_signal = np.zeros((B, total_samples), dtype=np.float32)
-    window_sum = np.zeros((total_samples,), dtype=np.float32)
+    out_signal = mx.zeros((B, total_samples), dtype=mx.float32)
+    window_sum = mx.zeros((total_samples,), dtype=mx.float32)
+    w_sq = window ** 2
 
-    wf_np = np.array(windowed)
-    w_sq = np.array(window) ** 2
+    K = win_length // hl
+    for k in range(K):
+        k_frames = windowed[:, k::K, :]
+        num_k = k_frames.shape[1]
+        if num_k > 0:
+            k_sig = k_frames.reshape(B, num_k * win_length)
+            k_start = k * hl
+            k_end = k_start + num_k * win_length
+            pad_left = k_start
+            pad_right = total_samples - k_end
+            out_signal = out_signal + mx.pad(k_sig, [(0, 0), (pad_left, pad_right)])
+            k_w_sq = mx.repeat(w_sq[None, :], num_k, axis=0).reshape(-1)
+            window_sum = window_sum + mx.pad(k_w_sq, [(pad_left, pad_right)])
 
-    for t_idx in range(num_frames):
-        start = t_idx * hl
-        end = start + win_length
-        out_signal[:, start:end] += wf_np[:, t_idx, :]
-        window_sum[start:end] += w_sq
-
-    window_sum = np.maximum(window_sum, 1e-7)
-    recon = out_signal / window_sum[np.newaxis, :]
+    window_sum = mx.maximum(window_sum, 1e-7)
+    recon = out_signal / window_sum[None, :]
 
     pad_amount = n_fft // 2
     if length is not None:
@@ -799,7 +805,7 @@ class HTDemucsMLX(nn.Module):
         xt = xt.transpose(0, 2, 1)  # (B, C_out, T)
         xt = xt * (1e-5 + stdt) + meant
         xt = xt.reshape(B, num_sources, S, -1)
-        xt = np.array(xt)[..., :length]
+        xt = xt[..., :length]
 
         out = x_wav + xt
         if squeeze_batch:

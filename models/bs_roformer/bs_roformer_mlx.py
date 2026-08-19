@@ -29,12 +29,11 @@ def rotate_half_mlx(x: mx.array) -> mx.array:
     return rotated.reshape(x.shape)
 
 
-def apply_rotary_mlx(freqs: mx.array, t: mx.array) -> mx.array:
-    """Applies rotary positional embeddings to queries or keys."""
+def apply_rotary_mlx(cos_cache: mx.array, sin_cache: mx.array, t: mx.array) -> mx.array:
+    """Applies rotary positional embeddings using precomputed cos/sin caches."""
     seq_len = t.shape[-2]
-    freqs_slice = freqs[:seq_len]
-    cos = mx.cos(freqs_slice)[None, None, :, :]
-    sin = mx.sin(freqs_slice)[None, None, :, :]
+    cos = cos_cache[:seq_len][None, None, :, :]
+    sin = sin_cache[:seq_len][None, None, :, :]
     return (t * cos) + (rotate_half_mlx(t) * sin)
 
 
@@ -72,13 +71,14 @@ def mlx_istft(
     hop_length: int = 512,
     win_length: int = 2048,
     length: Optional[int] = None,
-) -> np.ndarray:
+) -> mx.array:
     """
-    Computes inverse real STFT matching torch.istft with Hann window overlap-add synthesis.
+    Computes inverse real STFT matching torch.istft with vectorized Hann window overlap-add synthesis.
+    Supports arbitrary hop_length and win_length ratios.
     Args:
         spec_real_imag: (B, F, num_frames, 2)
     Returns:
-        (B, length) numpy array
+        (B, length) mx.array on Apple Silicon GPU
     """
     B, F, num_frames, _ = spec_real_imag.shape
     spec_c = spec_real_imag[..., 0] + 1j * spec_real_imag[..., 1]
@@ -90,20 +90,49 @@ def mlx_istft(
     windowed_frames = frames * window
 
     total_samples = (num_frames - 1) * hop_length + win_length
-    out_signal = np.zeros((B, total_samples), dtype=np.float32)
-    window_sum = np.zeros((total_samples,), dtype=np.float32)
+    out_signal = mx.zeros((B, total_samples), dtype=mx.float32)
+    window_sum = mx.zeros((total_samples,), dtype=mx.float32)
+    w_sq = window ** 2
 
-    wf_np = np.array(windowed_frames)
-    w_sq = np.array(window) ** 2
+    K = math.ceil(win_length / hop_length)
+    step = K * hop_length
+    gap = step - win_length
 
-    for t_idx in range(num_frames):
-        start = t_idx * hop_length
-        end = start + win_length
-        out_signal[:, start:end] += wf_np[:, t_idx, :]
-        window_sum[start:end] += w_sq
+    for k in range(K):
+        k_frames = windowed_frames[:, k::K, :]
+        num_k = k_frames.shape[1]
+        if num_k > 0:
+            if gap > 0:
+                k_frames_padded = mx.pad(k_frames, [(0, 0), (0, 0), (0, gap)])
+            else:
+                k_frames_padded = k_frames
+            k_sig = k_frames_padded.reshape(B, num_k * step)
+            k_start = k * hop_length
+            k_end = k_start + num_k * step
 
-    window_sum = np.maximum(window_sum, 1e-7)
-    recon = out_signal / window_sum[np.newaxis, :]
+            if k_end > total_samples:
+                k_sig = k_sig[:, :total_samples - k_start]
+                k_end = total_samples
+
+            pad_left = k_start
+            pad_right = total_samples - k_end
+            if pad_right >= 0 and pad_left >= 0:
+                out_signal = out_signal + mx.pad(k_sig, [(0, 0), (pad_left, pad_right)])
+
+            if gap > 0:
+                k_w_sq = mx.pad(w_sq, [(0, gap)])
+            else:
+                k_w_sq = w_sq
+            k_w_padded = mx.repeat(k_w_sq[None, :], num_k, axis=0).reshape(-1)
+            if k_start + num_k * step > total_samples:
+                k_w_padded = k_w_padded[:total_samples - k_start]
+
+            w_pad_right = total_samples - (k_start + k_w_padded.shape[0])
+            if w_pad_right >= 0 and pad_left >= 0:
+                window_sum = window_sum + mx.pad(k_w_padded, [(pad_left, w_pad_right)])
+
+    window_sum = mx.maximum(window_sum, 1e-7)
+    recon = out_signal / window_sum[None, :]
 
     pad_amount = n_fft // 2
     if length is not None:
@@ -119,8 +148,7 @@ class RMSNormMLX(nn.Module):
         self.eps = eps
 
     def __call__(self, x: mx.array) -> mx.array:
-        norm = mx.sqrt(mx.sum(x ** 2, axis=-1, keepdims=True) + self.eps)
-        return (x / norm) * self.scale * self.gamma
+        return mx.fast.rms_norm(x, self.gamma, eps=self.eps)
 
 
 class FeedForwardMLX(nn.Module):
@@ -150,7 +178,7 @@ class AttentionMLX(nn.Module):
         self.to_gates = nn.Linear(dim, heads)
         self.to_out = nn.Linear(dim_inner, dim, bias=False)
 
-    def __call__(self, x: mx.array, rotary_freqs: Optional[mx.array] = None) -> mx.array:
+    def __call__(self, x: mx.array, rotary_freqs: Optional[Any] = None) -> mx.array:
         B, N, D = x.shape
         h_norm = self.norm(x)
         qkv = self.to_qkv(h_norm)
@@ -161,8 +189,8 @@ class AttentionMLX(nn.Module):
         v = qkv[:, :, 2].transpose(0, 2, 1, 3)
 
         if rotary_freqs is not None:
-            q = apply_rotary_mlx(rotary_freqs, q)
-            k = apply_rotary_mlx(rotary_freqs, k)
+            q = mx.fast.rope(q, dims=self.dim_head, traditional=True, base=10000.0, scale=1.0, offset=0)
+            k = mx.fast.rope(k, dims=self.dim_head, traditional=True, base=10000.0, scale=1.0, offset=0)
 
         out = mx.fast.scaled_dot_product_attention(q, k, v, scale=self.scale)
         gates = self.to_gates(h_norm).transpose(0, 2, 1)[:, :, :, None]
@@ -285,8 +313,7 @@ class BSRoformerMLX(nn.Module):
         self.stft_win_length = stft_win_length
         self.zero_dc = zero_dc
 
-        self.time_rotary_freqs = get_rotary_freqs(dim_head, max_seq_len)
-        self.freq_rotary_freqs = get_rotary_freqs(dim_head, max_seq_len)
+        self.dim_head = dim_head
 
         freqs_per_bands_with_complex = tuple(2 * f * self.audio_channels for f in freqs_per_bands)
         self.band_split = BandSplitMLX(dim=dim, dim_inputs=freqs_per_bands_with_complex)
@@ -357,12 +384,12 @@ class BSRoformerMLX(nn.Module):
         for time_trans, freq_trans in self.blocks:
             # Time transformer: reshape to (B * num_bands, num_frames, dim)
             x_time = x.transpose(0, 2, 1, 3).reshape(B * num_bands, num_frames, self.dim)
-            x_time = time_trans(x_time, rotary_freqs=self.time_rotary_freqs)
+            x_time = time_trans(x_time, rotary_freqs=True)
             x = x_time.reshape(B, num_bands, num_frames, self.dim).transpose(0, 2, 1, 3)
 
             # Freq transformer: reshape to (B * num_frames, num_bands, dim)
             x_freq = x.reshape(B * num_frames, num_bands, self.dim)
-            x_freq = freq_trans(x_freq, rotary_freqs=self.freq_rotary_freqs)
+            x_freq = freq_trans(x_freq, rotary_freqs=True)
             x = x_freq.reshape(B, num_frames, num_bands, self.dim)
 
         x = self.final_norm(x)

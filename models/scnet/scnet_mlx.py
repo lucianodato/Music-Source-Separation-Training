@@ -51,13 +51,14 @@ def mlx_istft_scnet(
     win_length: int = 4096,
     normalized: bool = True,
     length: Optional[int] = None,
-) -> np.ndarray:
+) -> mx.array:
     """
-    Computes inverse real STFT matching torch.istft with rectangular window overlap-add synthesis.
+    Computes inverse real STFT matching torch.istft with vectorized rectangular window overlap-add synthesis.
+    Supports arbitrary hop_length and win_length ratios.
     Args:
         spec_real_imag: (B, F, num_frames, 2)
     Returns:
-        (B, length) numpy array
+        (B, length) mx.array on Apple Silicon GPU
     """
     B, F, num_frames, _ = spec_real_imag.shape
     spec_c = spec_real_imag[..., 0] + 1j * spec_real_imag[..., 1]
@@ -68,20 +69,49 @@ def mlx_istft_scnet(
     frames = mx.fft.irfft(spec_c, n=n_fft, axis=-1)[..., :win_length]
 
     total_samples = (num_frames - 1) * hop_length + win_length
-    out_signal = np.zeros((B, total_samples), dtype=np.float32)
-    window_sum = np.zeros((total_samples,), dtype=np.float32)
+    out_signal = mx.zeros((B, total_samples), dtype=mx.float32)
+    window_sum = mx.zeros((total_samples,), dtype=mx.float32)
+    w_sq = mx.ones((win_length,), dtype=mx.float32)
 
-    wf_np = np.array(frames)
-    w_sq = np.ones((win_length,), dtype=np.float32)
+    K = math.ceil(win_length / hop_length)
+    step = K * hop_length
+    gap = step - win_length
 
-    for t_idx in range(num_frames):
-        start = t_idx * hop_length
-        end = start + win_length
-        out_signal[:, start:end] += wf_np[:, t_idx, :]
-        window_sum[start:end] += w_sq
+    for k in range(K):
+        k_frames = frames[:, k::K, :]
+        num_k = k_frames.shape[1]
+        if num_k > 0:
+            if gap > 0:
+                k_frames_padded = mx.pad(k_frames, [(0, 0), (0, 0), (0, gap)])
+            else:
+                k_frames_padded = k_frames
+            k_sig = k_frames_padded.reshape(B, num_k * step)
+            k_start = k * hop_length
+            k_end = k_start + num_k * step
 
-    window_sum = np.maximum(window_sum, 1e-7)
-    recon = out_signal / window_sum[np.newaxis, :]
+            if k_end > total_samples:
+                k_sig = k_sig[:, :total_samples - k_start]
+                k_end = total_samples
+
+            pad_left = k_start
+            pad_right = total_samples - k_end
+            if pad_right >= 0 and pad_left >= 0:
+                out_signal = out_signal + mx.pad(k_sig, [(0, 0), (pad_left, pad_right)])
+
+            if gap > 0:
+                k_w_sq = mx.pad(w_sq, [(0, gap)])
+            else:
+                k_w_sq = w_sq
+            k_w_padded = mx.repeat(k_w_sq[None, :], num_k, axis=0).reshape(-1)
+            if k_start + num_k * step > total_samples:
+                k_w_padded = k_w_padded[:total_samples - k_start]
+
+            w_pad_right = total_samples - (k_start + k_w_padded.shape[0])
+            if w_pad_right >= 0 and pad_left >= 0:
+                window_sum = window_sum + mx.pad(k_w_padded, [(pad_left, w_pad_right)])
+
+    window_sum = mx.maximum(window_sum, 1e-7)
+    recon = out_signal / window_sum[None, :]
 
     pad_amount = n_fft // 2
     if length is not None:

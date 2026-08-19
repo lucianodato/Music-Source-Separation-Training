@@ -84,9 +84,14 @@ def load_mlx_model(
     model_type: str,
     config_path: str,
     checkpoint_path: str,
+    use_float16: bool = True,
 ) -> Tuple[Any, Dict[str, Any], str]:
     """
     Loads and converts model weights natively into an MLX neural network module.
+
+    Args:
+        use_float16: If True, cast model weights to float16 for faster inference
+                     and lower memory usage on Apple Silicon. Defaults to True.
 
     Returns:
         (mlx_model, config_dict, resolved_model_type)
@@ -105,19 +110,47 @@ def load_mlx_model(
     if "bs_roformer" in clean_mtype or "roformer" in clean_mtype:
         from models.bs_roformer.bs_roformer_mlx import load_bs_roformer_mlx_from_ckpt
         model = load_bs_roformer_mlx_from_ckpt(config, checkpoint_path)
-        return model, config, "bs_roformer"
+        resolved_type = "bs_roformer"
 
     elif "scnet" in clean_mtype:
         from models.scnet.scnet_mlx import load_scnet_mlx_from_ckpt
         model = load_scnet_mlx_from_ckpt(config, checkpoint_path)
-        return model, config, "scnet"
+        resolved_type = "scnet"
 
     elif "htdemucs" in clean_mtype or "demucs" in clean_mtype:
         from models.htdemucs_mlx import load_htdemucs_mlx_from_ckpt
         model = load_htdemucs_mlx_from_ckpt(config, checkpoint_path)
-        return model, config, "htdemucs"
+        resolved_type = "htdemucs"
 
-    raise NotImplementedError(f"Native MLX model loader for '{model_type}' is not implemented yet.")
+    else:
+        raise NotImplementedError(f"Native MLX model loader for '{model_type}' is not implemented yet.")
+
+    # Performance optimization: float16 precision
+    if use_float16 and resolved_type in ("bs_roformer", "scnet"):
+        _apply_float16(model)
+        mx.eval(model.parameters())
+
+    return model, config, resolved_type
+
+
+def _apply_float16(model: Any) -> None:
+    """Recursively cast all model parameter arrays to float16 for faster inference."""
+    params = model.parameters()
+    float16_params = _cast_params_recursive(params)
+    model.update(float16_params)
+
+
+def _cast_params_recursive(params):
+    """Recursively walks a nested param structure and casts float32 arrays to float16."""
+    if isinstance(params, mx.array):
+        if params.dtype == mx.float32:
+            return params.astype(mx.float16)
+        return params
+    elif isinstance(params, dict):
+        return {k: _cast_params_recursive(v) for k, v in params.items()}
+    elif isinstance(params, list):
+        return [_cast_params_recursive(v) for v in params]
+    return params
 
 
 def _get_windowing_array_np(window_size: int, fade_size: int) -> np.ndarray:
@@ -229,7 +262,7 @@ def demix_mlx(
         mx.eval(out_mlx)
 
         # Output shape is typically (1, num_stems, channels, eff_chunk_size) or (1, channels, eff_chunk_size)
-        out_np = np.array(out_mlx)
+        out_np = np.array(out_mlx.astype(mx.float32))
         if out_np.ndim == 4:
             out_chunk = out_np[0]  # (num_stems, channels, eff_chunk_size)
         elif out_np.ndim == 3 and num_instruments == 1:
