@@ -9,8 +9,13 @@ from models.bs_roformer.attend import Attend
 
 from torch.utils.checkpoint import checkpoint
 
-from beartype.typing import Tuple, Optional, List, Callable
-from beartype import beartype
+try:
+    from beartype.typing import Tuple, Optional, List, Callable
+    from beartype import beartype
+except ImportError:
+    from typing import Tuple, Optional, List, Callable
+    def beartype(fn):
+        return fn
 
 from rotary_embedding_torch import RotaryEmbedding
 
@@ -119,7 +124,11 @@ class Attention(Module):
     def forward(self, x):
         x = self.norm(x)
 
-        q, k, v = rearrange(self.to_qkv(x), 'b n (qkv h d) -> qkv b h n d', qkv=3, h=self.heads)
+        qkv = self.to_qkv(x)
+        q, k, v = qkv.chunk(3, dim=-1)
+        q = rearrange(q, 'b n (h d) -> b h n d', h=self.heads)
+        k = rearrange(k, 'b n (h d) -> b h n d', h=self.heads)
+        v = rearrange(v, 'b n (h d) -> b h n d', h=self.heads)
 
         if exists(self.pope_embed):
             assert _HAS_POPE, "PoPE requested but PoPE_pytorch is not installed"
@@ -334,14 +343,7 @@ class MaskEstimator(Module):
             self.to_freqs.append(mlp)
 
     def forward(self, x):
-        x = x.unbind(dim=-2)
-
-        outs = []
-
-        for band_features, mlp in zip(x, self.to_freqs):
-            freq_out = mlp(band_features)
-            outs.append(freq_out)
-
+        outs = [mlp(x[:, :, i, :]) for i, mlp in enumerate(self.to_freqs)]
         return torch.cat(outs, dim=-1)
 
 

@@ -9,8 +9,13 @@ from models.bs_roformer.attend import Attend
 
 from torch.utils.checkpoint import checkpoint
 
-from beartype.typing import Tuple, Optional, List, Callable
-from beartype import beartype
+try:
+    from beartype.typing import Tuple, Optional, List, Callable
+    from beartype import beartype
+except ImportError:
+    from typing import Tuple, Optional, List, Callable
+    def beartype(fn):
+        return fn
 
 from rotary_embedding_torch import RotaryEmbedding
 
