@@ -48,12 +48,12 @@ def can_run_on_mlx(
     mt = (model_type or "").lower().strip()
 
     # Direct model type checks
-    supported_keywords = ["bs_roformer", "roformer", "scnet", "htdemucs", "demucs"]
-    unsupported_keywords = ["bandit", "mamba", "swin", "segm", "torchseg", "conformer_model"]
+    supported_keywords = ["bs_roformer", "scnet", "htdemucs", "demucs"]
+    unsupported_keywords = ["mel_band", "melband", "bandit", "mamba", "swin", "segm", "torchseg", "conformer_model"]
 
     for unsup in unsupported_keywords:
         if unsup in mt:
-            return False, f"Architecture '{model_type}' (recurrent/custom kernels) does not have an MLX port yet."
+            return False, f"Architecture '{model_type}' (recurrent/custom mel kernels) does not have an MLX port yet."
 
     for sup in supported_keywords:
         if sup in mt:
@@ -107,7 +107,7 @@ def load_mlx_model(
     if not clean_mtype and isinstance(config, dict):
         clean_mtype = str(config.get("training", {}).get("model_type", "")).lower()
 
-    if "bs_roformer" in clean_mtype or "roformer" in clean_mtype:
+    if "bs_roformer" in clean_mtype or (clean_mtype == "roformer"):
         from models.bs_roformer.bs_roformer_mlx import load_bs_roformer_mlx_from_ckpt
         model = load_bs_roformer_mlx_from_ckpt(config, checkpoint_path)
         resolved_type = "bs_roformer"
